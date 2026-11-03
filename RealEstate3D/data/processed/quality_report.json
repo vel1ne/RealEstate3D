@@ -1,0 +1,43 @@
+{
+  "project_date": "2026-10-27",
+  "dataset_key": "saratov_osm_4a9f91bb2a89",
+  "retrieved_at": "2026-10-27T18:25:13.359501+00:00",
+  "osm_base_at": "2026-10-27T18:23:02Z",
+  "bbox_wsen": [
+    45.7,
+    51.35,
+    46.35,
+    51.82
+  ],
+  "sha256": "4a9f91bb2a89cc77083f30ed72d216b385722a0a11c5313db648e17949cf0c90",
+  "road_ways": 39796,
+  "point_constraints": 2301,
+  "turn_relations": 546,
+  "rejected_ways": [],
+  "approx_way_length_km": 10705.2,
+  "highway_counts": {
+    "primary": 651,
+    "trunk": 493,
+    "trunk_link": 25,
+    "service": 23925,
+    "residential": 5851,
+    "unclassified": 2261,
+    "tertiary": 726,
+    "primary_link": 51,
+    "tertiary_link": 30,
+    "secondary": 610,
+    "secondary_link": 46,
+    "track": 4993,
+    "living_street": 105,
+    "construction": 29
+  },
+  "with_hgv_tag": 71,
+  "with_maxweight_numeric": 6,
+  "with_maxheight_numeric": 46,
+  "with_any_conditional_tag": 4,
+  "hgv_values": {
+    "destination": 49,
+    "no": 17,
+    "yes": 5
+  }
+}

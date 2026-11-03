@@ -1,0 +1,65 @@
+{
+  "package_status": "research_prototype",
+  "project_date": "2026-10-27",
+  "source_osm_base_at": "2026-10-27T18:23:02Z",
+  "sqlite": {
+    "integrity": "ok",
+    "foreign_key_errors": [],
+    "table_rows": {
+      "dataset": 1,
+      "road_segment": 39796,
+      "point_constraint": 2301,
+      "turn_restriction_raw": 546
+    }
+  },
+  "hgv_tagged_road_ways": 71,
+  "hgv_tag_coverage_percent": 0.1784,
+  "postgis_import_executed": false,
+  "backend_api_implemented": false,
+  "routing_graph_built": false,
+  "verified_truck_access_labels_available": false,
+  "property_media_dataset_available": false,
+  "geometry": {
+    "crs": "EPSG:4326",
+    "coordinate_order": [
+      "longitude",
+      "latitude"
+    ],
+    "scope_bbox_wsen": [
+      45.7,
+      51.35,
+      46.35,
+      51.82
+    ]
+  },
+  "files": {
+    "data/processed/saratov_roads.sqlite": {
+      "bytes": 21716992,
+      "sha256": "c873c40c3e16762b3f31b08c420d28dc527e9e58ab224394f1c99be95502b5e2"
+    },
+    "data/processed/roads.geojson": {
+      "bytes": 29014125,
+      "sha256": "5f8e2b7fdd474c43678dd83ffa376d173bf66d6834232113794a4e57fe179d32"
+    },
+    "data/processed/point_constraints.geojson": {
+      "bytes": 423208,
+      "sha256": "e94594c4a29c433c11b23463e77b445203190e67a0c2053a77a53af4b46ef78c"
+    },
+    "data/processed/turn_restrictions.json": {
+      "bytes": 550029,
+      "sha256": "051f131137acff3ed59935fd9ff965ef050cf7105f36e9f5193d2c9c67f78ef2"
+    },
+    "sql/01_schema_postgis.sql": {
+      "bytes": 5754,
+      "sha256": "739522ca611836a4d7e50ac3d89552ad471864e564da8127643b559fda01754c"
+    },
+    "sql/02_import_roads_postgis.sql": {
+      "bytes": 63952779,
+      "sha256": "297a0cee8f59840ef8e31c4407f38d9cc9080d70a152ce261583036a847522a3"
+    },
+    "scripts/build_data.py": {
+      "bytes": 9698,
+      "sha256": "551ce21cb5b8cd034238ec870da405843e6c5519338266cede2af7bf2311a173"
+    }
+  }
+}
