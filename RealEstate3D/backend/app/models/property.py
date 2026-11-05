@@ -1,10 +1,15 @@
-from datetime import datetime
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
-from sqlalchemy import Boolean, DateTime, Float, String, Text, func
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy import ForeignKey, String, Text
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
+
+
+if TYPE_CHECKING:
+    from app.models.property_filter_value import PropertyFilterValue
+    from app.models.property_type import PropertyType
 
 
 class Property(Base):
@@ -15,38 +20,31 @@ class Property(Base):
         primary_key=True,
         default=lambda: str(uuid4()),
     )
-    name: Mapped[str] = mapped_column(String(255), nullable=False)
-    address: Mapped[str] = mapped_column(String(500), nullable=False)
-    property_type: Mapped[str] = mapped_column(String(100), nullable=False)
 
-    area: Mapped[float] = mapped_column(Float, nullable=False)
-    monthly_rent: Mapped[float] = mapped_column(Float, nullable=False)
-
-    ceiling_height: Mapped[float | None] = mapped_column(
-        Float,
-        nullable=True,
-    )
-    floor_load: Mapped[float | None] = mapped_column(
-        Float,
-        nullable=True,
-    )
-    power_kw: Mapped[float | None] = mapped_column(
-        Float,
-        nullable=True,
-    )
-
-    truck_access: Mapped[bool] = mapped_column(
-        Boolean,
-        default=False,
+    name: Mapped[str] = mapped_column(
+        String(200),
         nullable=False,
     )
+
     description: Mapped[str | None] = mapped_column(
         Text,
         nullable=True,
     )
 
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        server_default=func.now(),
+    address: Mapped[str] = mapped_column(
+        String(500),
         nullable=False,
+    )
+
+    property_type_id: Mapped[str] = mapped_column(
+        ForeignKey("property_types.id"),
+        nullable=False,
+    )
+
+    property_type: Mapped["PropertyType"] = relationship(
+        back_populates="properties",
+    )
+    filter_values: Mapped[list["PropertyFilterValue"]] = relationship(
+        back_populates="property",
+        cascade="all, delete-orphan",
     )
