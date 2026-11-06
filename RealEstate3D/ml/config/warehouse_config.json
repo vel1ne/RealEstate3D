@@ -1,0 +1,109 @@
+{
+  "_описание": "Настройки оценки зданий под склад. Python (src/*.py) и карта читают этот файл — меняйте только здесь.",
+
+  "random_state": 42,
+
+  "exits": {
+    "_": "Выезды из города. share — доля фур через выезд (допущение, используется в потоках и в «чего мы не знаем»).",
+    "names": ["СКАД", "Московское шоссе", "Вольский тракт", "Ново-Астраханское шоссе", "Сокурский тракт", "«Каспий» (Р-22)"],
+    "share": {"СКАД": 0.25, "Московское шоссе": 0.25, "Вольский тракт": 0.25, "Ново-Астраханское шоссе": 0.25,
+              "Сокурский тракт": 0.0, "«Каспий» (Р-22)": 0.0}
+  },
+
+  "buildings": {
+    "_": "Какие здания оцениваем: с адресом или названием — всегда; без них — если площадь не меньше min_area_m2.",
+    "min_area_m2": 40,
+    "city_cell_m": 300,
+    "city_min_buildings_300m": 15,
+    "city_min_cluster_cells": 200
+  },
+
+  "lastmile": {
+    "_": "Последняя миля: путь фуры по графу от здания до ближайшей магистрали (trunk/primary/secondary).",
+    "max_snap_m": 300,
+    "yard_near_res_buildings_m": 50,
+    "yard_min_res_buildings": 3,
+    "narrow_width_m": 3.5
+  },
+
+  "city_reach": {
+    "_": "Центры спроса: кластеры жилья и магазинов OSM (населения нет — допущение).",
+    "n_centers": 200,
+    "minutes_near": 15,
+    "minutes_far": 25
+  },
+
+  "labels": {
+    "_": "Метка для обучения: где склады стоят сейчас. positive_types — теги склада; zone_min_area_m2 — нежилое здание в промзоне не меньше этой площади тоже положительное.",
+    "positive_types": ["warehouse", "industrial", "hangar", "storage", "manufacture", "factory"],
+    "zone_min_area_m2": 100,
+    "zone_exclude_types": ["garages", "garage", "shed", "roof", "greenhouse", "ruins", "construction", "kiosk"],
+    "main_variant": "A"
+  },
+
+  "model": {
+    "_": "Проверка на незнакомых районах: блоки 3×3 км, folds разбиений. fast=true — меньше перебора гиперпараметров.",
+    "block_km": 3,
+    "folds": 5,
+    "inner_folds": 3,
+    "precision_at": 100,
+    "hgb_grid": [
+      {"learning_rate": 0.05, "max_leaf_nodes": 15, "l2_regularization": 1.0, "max_iter": 300},
+      {"learning_rate": 0.1, "max_leaf_nodes": 31, "l2_regularization": 1.0, "max_iter": 200},
+      {"learning_rate": 0.05, "max_leaf_nodes": 31, "l2_regularization": 0.0, "max_iter": 400}
+    ],
+    "logreg_C": [0.03, 0.3, 3.0]
+  },
+
+  "alpha": 0.7,
+  "_alpha": "итог = alpha·(балл модели) + (1−alpha)·(формула профиля). alpha = 1 — чистая модель.",
+
+  "profiles": {
+    "universal": {"name": "Универсальный", "weights": {"exit": 25, "city": 20, "lastmile": 25, "object": 15, "rail_cluster": 15}},
+    "transit":   {"name": "Транзит и межгород", "weights": {"exit": 35, "city": 5, "lastmile": 30, "object": 15, "rail_cluster": 15}},
+    "city":      {"name": "Доставка по городу", "weights": {"exit": 10, "city": 35, "lastmile": 25, "object": 15, "rail_cluster": 15}}
+  },
+  "default_profile": "universal",
+
+  "subscores": {
+    "_": "Подбаллы 0–100 для формулы профиля.",
+    "exit_best_min": 5, "exit_worst_min": 35, "exit_best_share": 0.65, "exit_backup_share": 0.35,
+    "city_mean_good_min": 12, "city_mean_bad_min": 35, "city_share_weight": 0.4,
+    "lastmile_len_ok_m": 200, "lastmile_len_bad_m": 1500, "lastmile_len_penalty": 40,
+    "lastmile_res_penalty": 35, "lastmile_turns_bad": 8, "lastmile_turns_penalty": 10,
+    "lastmile_dead_end_penalty": 5, "lastmile_narrow_penalty": 10,
+    "lastmile_snap_ok_m": 30, "lastmile_snap_bad_m": 300, "lastmile_snap_penalty": 30,
+    "object_area_bad_m2": 50, "object_area_good_m2": 500,
+    "rail_good_m": 300, "rail_bad_m": 3000, "cluster_good_n": 10
+  },
+
+  "rules": [
+    {"id": "no_access", "cap": 20, "text": "нет проезда для фуры: рядом нет открытой для грузовиков дороги или путь к магистрали идёт только по закрытым участкам"},
+    {"id": "yard", "cap": 40, "share": 0.6, "meters": 400, "text": "подъезд преимущественно по жилым дворам и жилым улицам"},
+    {"id": "residential_type", "cap": 30, "text": "похоже, это жилой дом (тип здания в OSM)"},
+    {"id": "residential_quarter", "cap": 40, "text": "здание без указанного типа внутри жилого квартала (OSM)"},
+    {"id": "small", "cap": 50, "min_area_m2": 100, "text": "здание меньше 100 м²"}
+  ],
+
+  "badges": [
+    {"min": 75, "label": "Отлично", "color": "#1a7f37"},
+    {"min": 55, "label": "Хорошо", "color": "#4d9a2a"},
+    {"min": 35, "label": "Средне", "color": "#b7791f"},
+    {"min": 0,  "label": "Плохо", "color": "#b42318"}
+  ],
+
+  "zones": {
+    "_": "Зона = соседние клетки cell_m, где есть хотя бы min_good зданий с итогом ≥ zone_score (профиль «Универсальный»). good_score — порог «Отлично» для подсчёта.",
+    "cell_m": 300,
+    "zone_score": 87,
+    "good_score": 75,
+    "min_good": 2,
+    "suitable_score": 55,
+    "top_n": 15
+  },
+
+  "no_building_radius_km": 2,
+  "alternative_radius_km": 3,
+  "address_snap_m": 50,
+  "expert": {"min_labels": 60, "n_candidates": 150, "disputed_share": 0.5}
+}
