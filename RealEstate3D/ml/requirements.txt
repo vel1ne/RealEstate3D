@@ -1,0 +1,9 @@
+pandas
+numpy
+scipy
+shapely>=2.0
+scikit-learn>=1.4
+openpyxl
+joblib
+geopandas
+jupyter
