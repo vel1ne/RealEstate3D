@@ -28,3 +28,29 @@ htmlcov/
 # OS
 .DS_Store
 Thumbs.db
+
+# ---------- Data Engineering: сгенерированные дорожные данные (пересобираются скриптами) ----------
+data_engineering/data/raw/*.json
+data_engineering/data/backups/
+data_engineering/data/processed/*
+!data_engineering/data/processed/quality_report.json
+!data_engineering/data/processed/handoff_manifest.json
+ml/data/
+data_engineering/sql/02_import_roads_postgis.sql
+data_engineering/maps/saratov_trucks.html
+data_engineering/maps/preview.png
+
+# ---------- ML: веса моделей и эксперименты ----------
+ml/models/
+ml/mlruns/
+.ipynb_checkpoints/
+
+# ---------- Frontend ----------
+node_modules/
+frontend/dist/
+frontend/.next/
+
+# ---------- Общие тяжёлые / приватные файлы ----------
+*.sqlite
+*.db
+media/
