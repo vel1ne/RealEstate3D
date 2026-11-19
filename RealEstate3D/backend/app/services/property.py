@@ -2,7 +2,9 @@ from sqlalchemy.orm import Session
 
 from app.models.property import Property
 from app.repositories.property import PropertyRepository
+from app.repositories.property_type import PropertyTypeRepository
 from app.schemas.property import PropertyCreate, PropertyUpdate
+from app.services.property_type import PropertyTypeNotFoundError
 
 
 class PropertyNotFoundError(Exception):
@@ -12,6 +14,7 @@ class PropertyNotFoundError(Exception):
 class PropertyService:
     def __init__(self, db: Session) -> None:
         self.repository = PropertyRepository(db)
+        self.type_repository = PropertyTypeRepository(db)
 
     def get_all_properties(self) -> list[Property]:
         return self.repository.get_all()
@@ -27,6 +30,9 @@ class PropertyService:
         return property_obj
 
     def create_property(self, data: PropertyCreate) -> Property:
+        if self.type_repository.get_by_id(data.property_type_id) is None:
+            raise PropertyTypeNotFoundError("Property type not found")
+        
         return self.repository.create(data)
 
     def update_property(
