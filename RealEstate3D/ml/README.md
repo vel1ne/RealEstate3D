@@ -10,12 +10,49 @@
 pip install -r requirements.txt
 python src/osm_data.py         # один раз: здания и объекты OSM (уже скачанные не качаются заново)
 python src/build_model.py      # признаки → обучение и проверка 4 моделей → баллы → Excel, отчёт (≈ 10–15 мин)
-python src/make_map.py         # карта out/map/ и один файл out/Карта складов Саратова.html
+python src/make_map.py         # карта out/map/ и один файл out/Здания Саратова.html
 python src/make_notebook.py    # ноутбук для Colab и архив out/warehouse_model_colab.zip
 ```
 
 Быстрая проверка: `python src/build_model.py --fast` (без подбора гиперпараметров) или `--test` (часть города).
-Карта: `out/map/Открыть карту складов.cmd` (с подложкой OSM) или двойной щелчок по `out/Карта складов Саратова.html`.
+Карта: `out/map/Открыть карту складов.cmd` (с подложкой OSM) или двойной щелчок по `out/Здания Саратова.html`.
+
+Чтобы подключить сверенную таблицу ГКО, выполните из `ml/`:
+
+```text
+python ../data_engineering/scripts/link_buildings.py "путь к сверенной таблице.xlsx" --review-csv ../data_engineering/data/processed/saratov_buildings_review.csv
+python src/make_map.py
+```
+
+Реестр хранится в `data_engineering/data/processed/saratov_buildings.sqlite`. Записи из ГКО
+привязываются к существующим контурам OSM по адресу и координатам. В базе представление
+`building_manual_review` содержит непривязанные записи и причины. Карта показывает площадь
+контура OSM и площадь по ГКО раздельно. Вкладки типов работают и без файла реестра.
+На карте грузовая доступность оценивается только для складов и производственных зданий.
+Обе категории пока используют одни веса. По остальным зданиям доступна карточка объекта.
+
+Для массового заполнения карточек используйте полный перечень ГКО 2023 и, при наличии,
+[архив Parquet ГИС ЖКХ](https://tochno.st/datasets/gisgkh). Команды из `ml/`:
+
+```text
+python ../data_engineering/scripts/enrich_city_buildings.py data/gko/zdania250523.xlsx data/gko/saratov_buildings_gko.json --housing data/gko/gisgkh_20260917_parquet.zip --osm-addresses data/osm/addresses_saratov.json
+python src/make_map.py
+```
+
+Массовый импорт создаёт `data_engineering/data/processed/saratov_city_buildings.sqlite`.
+Таблица `buildings` содержит сведения для карты, `manual_review` — непривязанные записи ГКО
+с причинами. Для первого чтения полного Excel потребуется несколько минут. Чтобы заново
+прочитать обновлённый перечень, задайте новый путь для промежуточного городского JSON.
+Параметр `--osm-addresses` принимает выгрузку Overpass с узлами `addr:housenumber`.
+Карта может показывать только карточки, где есть год постройки, площадь здания и тип.
+
+По умолчанию карта открывается на вкладке «Вся коммерция». Тип здания и бизнес внутри
+показываются отдельно. Жилой дом с магазином доступен во вкладках «Жильё» и «Торговля».
+Для торговых и иных заведений карта использует снимок OSM `data/osm/osm_poi.json` и
+дополнительную выгрузку центра `data/osm/stolypin_openstreetmap.osm`, если она есть.
+Точечное заведение связывается с контуром, только если его точка попала ровно в один контур.
+Сопоставления, проверенные вручную, сохраняются в `data_engineering/data/manual_building_links.json`
+с кадастровым номером, идентификатором OSM, адресом и источником. Они используются при пересборке реестра.
 
 ## Структура
 
