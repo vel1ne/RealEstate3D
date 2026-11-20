@@ -3,7 +3,6 @@ from sqlalchemy import select
 from app.db.session import SessionLocal
 from app.models import PropertyType
 
-
 PROPERTY_TYPES = [
     {
         "name": "Торговое помещение",

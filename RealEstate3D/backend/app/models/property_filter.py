@@ -1,18 +1,31 @@
-from uuid import uuid4
 from typing import TYPE_CHECKING
+from uuid import uuid4
 
-from sqlalchemy import Boolean, ForeignKey, String
+from sqlalchemy import Boolean, ForeignKey, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
 
 if TYPE_CHECKING:
-    from app.models.property_type import PropertyType
     from app.models.property_filter_value import PropertyFilterValue
+    from app.models.property_type import PropertyType
 
 
 class PropertyFilter(Base):
     __tablename__ = "property_filters"
+
+    __table_args__ = (
+        UniqueConstraint(
+            "property_type_id",
+            "slug",
+            name="uq_property_filter_type_slug",
+        ),
+        UniqueConstraint(
+            "property_type_id",
+            "name",
+            name="uq_property_filter_type_name",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(
         String(36),

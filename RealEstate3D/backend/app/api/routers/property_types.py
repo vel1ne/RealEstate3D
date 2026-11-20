@@ -1,18 +1,21 @@
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy.orm import Session
 
-from app.api.dependencies import get_db
-from app.repositories.property_type import PropertyTypeRepository
+from app.api.dependencies import get_property_type_service
 from app.schemas.property_filter import PropertyFilterSchema
 from app.schemas.property_type import PropertyTypeSchema
+from app.services.property_type import (
+    PropertyTypeNotFoundError,
+    PropertyTypeService,
+)
 
 router = APIRouter(prefix="/property-types", tags=["Property Types"])
 
 
 @router.get("/", response_model=list[PropertyTypeSchema])
-def get_property_types(db: Session = Depends(get_db)):
-    repository = PropertyTypeRepository(db)
-    return repository.get_all()
+def get_property_types(
+    service: PropertyTypeService = Depends(get_property_type_service),
+):
+    return service.get_all()
 
 
 @router.get(
@@ -21,15 +24,14 @@ def get_property_types(db: Session = Depends(get_db)):
 )
 def get_property_type_filters(
     slug: str,
-    db: Session = Depends(get_db),
+    service: PropertyTypeService = Depends(get_property_type_service),
 ):
-    repository = PropertyTypeRepository(db)
-    property_type = repository.get_by_slug(slug)
-
-    if property_type is None:
+    try:
+        property_type = service.get_by_slug(slug)
+    except PropertyTypeNotFoundError as error:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Property type not found",
-        )
+            detail=str(error),
+        ) from error
 
     return property_type.filters
