@@ -1,0 +1,29 @@
+[
+  {
+    "osm_id": 163056209,
+    "cadastral_number": "64:48:060208:115",
+    "address": "Саратов, пл. Театральная, д. 1/37",
+    "wall_material": "Кирпичные",
+    "underground_floors": 1,
+    "source": "Карточка НСПД, предоставленная пользователем",
+    "map_reference": "https://yandex.com/maps/194/saratov/house/teatralnaya_ploshchad_1_37/YE8YdgRkSkMDQFtrfXlycHxibQ%3D%3D/",
+    "note": "Адресная точка Яндекс Карт внутри контура жилого дома OSM. В ГКО, ГИС ЖКХ и карточке НСПД совпадают кадастровый номер и площадь 8809,8 м². Координаты записи ГИС ЖКХ попадают в соседний корпус аграрного университета."
+  },
+  {
+    "osm_id": 724265695,
+    "cadastral_number": "64:48:030356:83",
+    "address": "Саратов, ул Московская, д 155",
+    "source": "Перечень ГКО 2023 и Саратовская епархия",
+    "map_reference": "https://saratov-eparhia.ru/temples/kniaze-vladimirskoe-blagocinie-g-saratova/arxiereiskoe-podvore-xram-sviatyx-ravnoapostolnyx-mefodiia-i-kirilla-pri-sgu",
+    "note": "На Московской, 155 в OSM выделен храм Кирилла и Мефодия. В ГКО запись по этому адресу обозначена как храм. Год завершения 2017 и ввода 2018 указаны в ГКО; история прихода описывает освящение до этих дат."
+  },
+  {
+    "osm_id": 694791675,
+    "cadastral_number": "64:48:030356:46",
+    "address": "Саратов, ул Казачья Б., д 112",
+    "osm_address": "Саратов, Большая Казачья улица, д 112",
+    "source": "Перечень ГКО 2023 и документы СГМУ",
+    "map_reference": "https://www.tezaurus.sgmu.ru/docs/lifestyle/p1.1.pdf",
+    "note": "Документы СГМУ связывают патологоанатомический корпус с корпусом № 4 на Большой Казачьей, 112. Площадь 7635,4 м² и 1935 год совпадают с ГКО."
+  }
+]

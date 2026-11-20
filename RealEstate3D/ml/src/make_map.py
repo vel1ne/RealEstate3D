@@ -1,27 +1,284 @@
 """Интерактивная карта оценки зданий под склад: ml/out/map/ (index.html, label.html) и один файл
 ml/out/Карта складов Саратова.html.
 
-Баллы всех зданий предрасчитаны в Python (build_model.py). В браузере: выбор профиля (смена весов),
-тексты карточки (те же формулы, что scoring.py), маршруты фуры по графу и поиск по адресу.
+Признаки рассчитаны в Python (build_model.py). Карта оценивает грузовую доступность
+складов и производства, показывает карточки зданий и маршруты фур.
 Карта рисуется своим кодом на canvas (без Leaflet и других картографических библиотек):
 подложка — обычные плитки OpenStreetMap, поверх — здания, окрашенные по баллу.
 Запуск:  python src/make_map.py   (после build_model.py)
 """
-import json, os, pickle, shutil, sys
+import json, os, pickle, shutil, sqlite3, sys
+from collections import defaultdict
 
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import features as F                              # noqa: E402
 import scoring as sc                              # noqa: E402
-from paths import DE_SQLITE, OUT  # noqa: E402
-from build_model import RESULTS                   # noqa: E402
+from paths import DATA, DE_SQLITE, OSM, OUT, REPO  # noqa: E402
+from build_model import RESULTS  # noqa: E402
+from osm_data import BUILDING_RU, RES_TYPES, decode_poly  # noqa: E402
 
-SINGLE_NAME = "Карта складов Саратова.html"
+SINGLE_NAME = "Здания Саратова.html"
 
 
 def i10(a, k=10):
     return [int(v) for v in np.round(np.asarray(a, dtype=float) * k)]
+
+
+def building_category(osm_type):
+    if osm_type in {"warehouse", "storage"}:
+        return "warehouse"
+    if osm_type in {"industrial", "manufacture", "factory"}:
+        return "production"
+    if osm_type in RES_TYPES:
+        return "residential"
+    if osm_type in {"retail", "supermarket", "kiosk"}:
+        return "retail"
+    if osm_type in FOOD:
+        return "food"
+    if osm_type in {"hotel", "hostel", "guest_house", "motel"}:
+        return "hospitality"
+    if osm_type in {"office", "commercial"}:
+        return osm_type
+    if osm_type in {"transformer_tower", "substation", "service", "water_tower", "pumping_station",
+                    "guardhouse", "security_booth", "boiler_house", "storage_tank"}:
+        return "technical"
+    if osm_type in {"garage", "garages", "carport", "shed", "hangar"}:
+        return "auxiliary"
+    return "other"
+
+
+FOOD = {"restaurant", "cafe", "fast_food", "bar", "pub", "food_court", "ice_cream"}
+SERVICES = {"bank", "pharmacy", "clinic", "dentist", "veterinary", "car_wash", "fuel"}
+SERVICE_SHOPS = {
+    "hairdresser", "beauty", "massage", "tattoo", "travel_agency", "laundry",
+    "dry_cleaning", "tailor", "car_repair", "copyshop", "funeral_directors",
+    "shoe_repair", "locksmith", "tanning",
+}
+BUSINESS_NAMES = {
+    "restaurant": "Ресторан", "cafe": "Кафе", "fast_food": "Быстрое питание", "bar": "Бар",
+    "pub": "Паб", "food_court": "Фуд-корт", "ice_cream": "Кафе-мороженое", "bank": "Банк",
+    "pharmacy": "Аптека", "clinic": "Клиника", "dentist": "Стоматология",
+    "veterinary": "Ветеринарная клиника", "car_wash": "Автомойка", "fuel": "АЗС",
+    "hairdresser": "Парикмахерская", "beauty": "Салон красоты", "tattoo": "Тату-салон",
+    "laundry": "Прачечная", "dry_cleaning": "Химчистка", "car_repair": "Автосервис",
+    "supermarket": "Супермаркет", "bakery": "Пекарня", "clothes": "Магазин одежды",
+    "convenience": "Продуктовый магазин", "hotel": "Гостиница", "hostel": "Хостел",
+}
+
+
+def business_type(tags):
+    amenity, shop = tags.get("amenity"), tags.get("shop")
+    if tags.get("operator:type") in {"public", "government", "municipal", "religious", "ngo"}:
+        return None
+    if amenity in {"clinic", "dentist", "veterinary"} and not (
+        tags.get("operator:type") in {"private", "business"} or tags.get("fee") == "yes"
+    ):
+        return None
+    if amenity in FOOD:
+        return "food", BUSINESS_NAMES[amenity]
+    if amenity in {"car_wash", "fuel"}:
+        return "auto", BUSINESS_NAMES[amenity]
+    if shop in {"car", "car_repair", "tyres"}:
+        return "auto", {"car": "Автосалон", "car_repair": "Автосервис", "tyres": "Шины и шиномонтаж"}[shop]
+    if shop == "pawnbroker":
+        return "services", "Ломбард"
+    if amenity in SERVICES:
+        return "services", BUSINESS_NAMES[amenity]
+    if shop in SERVICE_SHOPS:
+        return "services", BUSINESS_NAMES.get(shop, "Услуги")
+    if shop and shop not in {"no", "vacant", "disused", "closed", "empty"}:
+        return "retail", BUSINESS_NAMES.get(shop, "Магазин")
+    if tags.get("office") in {"company", "insurance", "lawyer", "estate_agent", "financial",
+                              "accountant", "notary", "travel_agent", "it", "advertising_agency",
+                              "architect", "coworking", "telecommunication", "tax_advisor"}:
+        return "office", "Офис"
+    if tags.get("tourism") in {"hotel", "hostel", "guest_house", "motel"}:
+        return "hospitality", BUSINESS_NAMES.get(tags["tourism"], "Размещение")
+    return None
+
+
+def business_elements(path):
+    if path.suffix == ".osm":
+        from xml.etree.ElementTree import parse
+
+        for item in parse(path).getroot():
+            if item.tag not in {"node", "way", "relation"}:
+                continue
+            element = {"type": item.tag, "id": int(item.attrib["id"]),
+                       "tags": {t.attrib["k"]: t.attrib["v"] for t in item.findall("tag")}}
+            if item.tag == "node":
+                element.update(lon=float(item.attrib["lon"]), lat=float(item.attrib["lat"]))
+            yield element
+        return
+    with path.open(encoding="utf-8") as stream:
+        response = json.load(stream)
+    if response.get("remark"):
+        raise ValueError(f"Неполная выгрузка Overpass: {path}")
+    yield from response["elements"]
+
+
+def business_cards(buildings):
+    from shapely.geometry import Point, Polygon
+    from shapely.strtree import STRtree
+
+    ids, polygons = [], []
+    for osm_id, flat in zip(buildings["id"], buildings["poly"]):
+        if len(flat) < 8:
+            continue
+        polygon = Polygon(decode_poly(flat))
+        if polygon.is_valid and not polygon.is_empty:
+            ids.append(osm_id)
+            polygons.append(polygon)
+    tree = STRtree(polygons)
+    known_ids = set(buildings["id"])
+    cards = defaultdict(list)
+    seen = set()
+    for filename in ("stolypin_openstreetmap.osm", "businesses_saratov.json", "businesses_center.json", "osm_poi.json"):
+        path = OSM / filename
+        if not path.exists():
+            continue
+        for element in business_elements(path):
+            ref = (element["type"], element["id"])
+            if ref in seen:
+                continue
+            seen.add(ref)
+            tags = element.get("tags", {})
+            kind = business_type(tags)
+            if not kind:
+                continue
+            osm_id = -ref[1] if ref[0] == "relation" else ref[1]
+            if ref[0] == "node":
+                hits = tree.query(Point(element["lon"], element["lat"]), predicate="covered_by")
+                if len(hits) != 1:
+                    continue
+                osm_id = ids[hits[0]]
+            elif osm_id not in known_ids:
+                continue
+            category, label = kind
+            name = tags.get("name") or tags.get("brand")
+            level = tags.get("level")
+            record = {"category": category, "label": label, "name": name, "level": level}
+            if record not in cards[osm_id]:
+                cards[osm_id].append(record)
+    return cards
+
+
+GKO_USE = {
+    "retail": ("Магазины ", "Многофункциональные торговые объекты ", "Торговые киоски", "Рынки",
+               "Прочие многофункциональные торгово-сервисные"),
+    "food": ("Кафе ", "Рестораны", "Летние кафе"),
+    "office": ("Бизнес-центры",),
+    "services": ("Банки", "Фитнес-центры", "Ломбарды", "Объекты бытового обслуживания населения"),
+    "auto": ("Автомойки", "Станции технического обслуживания автомобилей", "Автозаправочные станции", "Автосалоны"),
+    "hospitality": ("Гостиницы",),
+    "production": ("Производственные, производственно-складские", "Мастерские"),
+    "warehouse": ("Складские здания", "Холодильники"),
+    "auxiliary": ("Здания ангарного типа", "Гаражи ", "Сараи"),
+    "technical": ("Трансформаторные подстанции", "Электроподстанции", "Электростанции", "Энергоблоки",
+                  "Центральная тепловая станция", "Котельные", "Здания тепловых пунктов",
+                  "Диспетчерские, аппаратные", "Контрольно-пропускные пункты", "Станции газораспределительные",
+                  "Пункты газораспределительные", "Насосные станции", "Водопроводные станции", "Водозаборные узлы",
+                  "Водомерные узлы", "Павильоны над скважинами", "Вентиляционные киоски", "Автоматические телефонные",
+                  "Здания очистных сооружений", "Весовые автомобильные", "Весовые железнодорожные",
+                  "Здания гидросооружений", "Ангары для самолетов", "Депо железнодорожные"),
+}
+
+
+def add_gko_use(cards):
+    path = DATA / "gko" / "saratov_buildings_gko.json"
+    if not path.exists():
+        return
+    by_row = {card["gko_source_row"]: card for card in cards.values() if card.get("gko_source_row")}
+    with path.open(encoding="utf-8") as stream:
+        for row in json.load(stream):
+            card = by_row.get(row["source_row"])
+            if card is None or card["cadastral_number"] != row["cadastral_number"]:
+                continue
+            group = row.get("subgroup") or ""
+            card["gko_group"] = group
+            name = (row.get("name") or "").lower()
+            if group == "Многоквартирные дома со встроенными нежилыми помещениями":
+                card["gko_nonresidential_units"] = True
+            if "учебн" in name:
+                card["educational_use"] = True
+                continue
+            if group.startswith(("Здания ангарного типа", "Многофункциональные торговые", "Прочие многофункциональные торгово-сервисные")) and ("склад" in name or "торговая база" in name):
+                card.update(gko_use="warehouse", gko_use_detail=row["name"])
+                continue
+            if group.startswith(("Сушилки, мельницы", "Объекты сельскохозяйственного производства")) and any(
+                word in name for word in ("мельниц", "сушил", "птичник", "теплиц", "коровник", "свинарник", "животновод")
+            ):
+                card.update(gko_use="production", gko_use_detail=row["name"])
+                continue
+            for kind, prefixes in GKO_USE.items():
+                if group.startswith(prefixes):
+                    card.update(gko_use=kind, gko_use_detail=group)
+                    break
+
+
+def registry_cards():
+    directory = REPO / "data_engineering" / "data" / "processed"
+    city_path = directory / "saratov_city_buildings.sqlite"
+    if city_path.exists():
+        db = sqlite3.connect(city_path.as_uri() + "?mode=ro", uri=True)
+        db.row_factory = sqlite3.Row
+        try:
+            cards = {row["osm_id"]: dict(row) for row in db.execute("""
+                SELECT osm_id, cadastral_number, address, area_m2, year_built, year_opened,
+                       osm_start_year, floors, osm_levels, purpose, category_gko, type_detail,
+                       gis_area_m2, gis_year_built, institution_area_m2, institution_source, osm_point_address,
+                       wall_material, underground_floors, manual_source, gko_source_row,
+                       CASE WHEN match_method LIKE 'ГАР ФНС%' THEN match_method END AS gar_source
+                FROM buildings
+                WHERE cadastral_number IS NOT NULL OR osm_start_year IS NOT NULL OR osm_levels IS NOT NULL
+                   OR gis_area_m2 IS NOT NULL OR gis_year_built IS NOT NULL OR institution_area_m2 IS NOT NULL
+                   OR osm_point_address IS NOT NULL
+            """)}
+            add_gko_use(cards)
+            return cards
+        finally:
+            db.close()
+    path = directory / "saratov_buildings.sqlite"
+    if not path.exists():
+        return {}
+    db = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)
+    db.row_factory = sqlite3.Row
+    try:
+        cards = db.execute("""
+            SELECT osm_id, address, area_m2, floors, year_built, cadastral_number, category_gko, type_detail
+            FROM building_registry WHERE osm_id IS NOT NULL
+        """)
+        return {card["osm_id"]: dict(card) for card in cards}
+    finally:
+        db.close()
+
+
+def add_registry_buildings(buildings, cards, types):
+    """Add matched OSM buildings outside the model coverage with registry cards only."""
+    missing = cards.keys() - set(buildings["id"])
+    if not missing:
+        return
+    with (OSM / "buildings.json").open(encoding="utf-8") as stream:
+        snapshot = json.load(stream)
+    for osm_id, lon, lat, area, kind, street, house, name, _, flat in snapshot["rows"]:
+        if osm_id not in missing:
+            continue
+        fields = {
+            "id": osm_id, "lat": lat, "lon": lon, "area": int(area), "poly": flat,
+            "addr": " ".join(filter(None, (street, house))), "name": name,
+            "type": types.setdefault(BUILDING_RU.get(kind, "тип не указан"), len(types)),
+            "category": building_category(kind), "piece": -1,
+        }
+        for key, values in buildings.items():
+            if key != "t":
+                values.append(fields.get(key, 0))
+        for times in buildings["t"]:
+            times.append(-1)
+        missing.remove(osm_id)
+    if missing:
+        raise ValueError(f"В снимке OSM отсутствуют контуры для {len(missing)} записей реестра")
 
 
 def build_data():
@@ -77,6 +334,7 @@ def build_data():
         "id": [int(v) for v in R["osm_id"]], "lat": R["lat"].round(6).tolist(), "lon": R["lon"].round(6).tolist(),
         "poly": R["poly"].tolist(), "addr": R["addr"].tolist(), "name": R["name"].tolist(),
         "type": [ti(t) for t in R["type_ru"]],
+        "category": [building_category(t) for t in R["building"]],
         "area": [int(v) for v in R["area_m2"]], "street": [si(s) for s in R["street_near"]],
         "ml": i10(R["ml"]), **{"s_" + k: i10(R["s_" + k]) for k in sc.PROFILE_PARTS},
         "mask": [int(v) for v in R["mask"]], "piece": [int(v) for v in R["snap_piece"]],
@@ -93,21 +351,21 @@ def build_data():
         **{"c_" + g: i10(R["c_" + g]) for g in F.FEATURE_GROUPS},
         "zone": [int(v) for v in R["zone"]], "cand": [int(v) for v in R["label_candidate"]],
     }
-    Z = S["zones"]
-    zones = [{"score": float(z["score"]), "mean": None if np.isnan(z["mean_score"]) else round(float(z["mean_score"]), 1),
-              "nSuitable": int(z["n_suitable"]), "nGood": int(z["n_good"]), "nB": int(z["n_buildings"]),
-              "area": float(z["area_ha"]), "streets": z["streets"], "best": int(z["best"]),
-              "top3": [int(i) for i in z["top3"]], "cells": z["cells"]} for _, z in Z.iterrows()]
+    scored_count = len(B["id"])
+    cards = registry_cards()
+    add_registry_buildings(B, cards, types)
     s = S["summary"].set_index(["variant", "model"])
     final = S["report"]["Итоговая модель"]
     data = {
-        "config": cfg, "featureGroupsRu": F.GROUP_RU, "partRu": sc.PART_RU, "ruleBits": sc.RULE_BITS,
+        "config": {k: v for k, v in cfg.items() if k not in {"profiles", "default_profile", "zones"}},
+        "assessmentWeights": cfg["profiles"]["universal"]["weights"], "featureGroupsRu": F.GROUP_RU, "partRu": sc.PART_RU, "ruleBits": sc.RULE_BITS,
         "pieces": pieces, "pieceMain": [1 if net.ways[p["way"]]["highway"] in MAINHW else 0 for p in net.pieces],
         "pc": pc, "turnNo": turn_no, "turnOnly": turn_only,
         "turnPenalty": {"uturn": 1.0, "left": 1.0, "right": 0.5},
         "exits": [{"name": k, "nodes": [node_index[n] for n in v["nodes"] if n in node_index],
                    "lonlat": v["lonlat"]} for k, v in exits.items()],
-        "B": B, "types": list(types), "streets": list(streets), "reasons": list(reasons), "zones": zones,
+        "B": B, "scoredCount": scored_count, "registry": cards, "businesses": business_cards(B),
+        "types": list(types), "streets": list(streets), "reasons": list(reasons),
         "center": list(F.CENTER),
         "model": {"name": final, "auc": round(float(s.loc[("A", final), "roc_auc"]), 3),
                   "ap": round(float(s.loc[("A", final), "ap"]), 3),
@@ -124,6 +382,7 @@ F_RES = __import__("osm_data").RES_TYPES
 COMMON_JS = r"""
 "use strict";
 const D = window.MAP_DATA, CFG = D.config, B = D.B, NB = B.id.length;
+const SCORED = D.scoredCount ?? NB;
 const KX = 111320 * Math.cos(51.55 * Math.PI / 180), KY = 110574;
 const distM = (la1, lo1, la2, lo2) => Math.hypot((la1 - la2) * KY, (lo1 - lo2) * KX);
 const esc = s => String(s == null ? "" : s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
@@ -136,10 +395,11 @@ const r10 = v => String(Math.floor(v / 10 + 0.5) * 10);                        /
 const PARTS = ["exit", "city", "lastmile", "object", "rail_cluster"];
 const GROUPS = ["exit", "lastmile", "env", "city", "infra"];
 const BITS = D.ruleBits;
-// ---------- балл профиля (как scoring.profile_score) ----------
+// ---------- шкала оценки доступности ----------
 function capOf(mask) { let cap = 100; for (const r of CFG.rules) if (mask & BITS[r.id]) cap = Math.min(cap, r.cap); return cap; }
-function profileScore(i, profile) {
-  const w = CFG.profiles[profile].weights; let acc = 0, wsum = 0;
+function logisticsScore(i) {
+  if (!canAssess(i)) return null;
+  const w = D.assessmentWeights; let acc = 0, wsum = 0;
   for (const k of PARTS) { acc += w[k] * (B["s_" + k][i] / 10); wsum += w[k]; }
   const a = CFG.alpha, total = a * (B.ml[i] / 10) + (1 - a) * (acc / wsum);
   return Math.min(total, capOf(B.mask[i]));
@@ -247,14 +507,14 @@ function inside(lat, lon, pts) { let c = false;
     const [yi, xi] = pts[i], [yj, xj] = pts[j];
     if ((yi > lat) !== (yj > lat) && lon < (xj - xi) * (lat - yi) / (yj - yi) + xi) c = !c; }
   return c; }
-function buildingAt(lat, lon) {
+function buildingAt(lat, lon, accept = () => true) {
   const cand = near(lat, lon, 300).sort((a, b) => distM(B.lat[a], B.lon[a], lat, lon) - distM(B.lat[b], B.lon[b], lat, lon));
-  for (const i of cand) if (inside(lat, lon, poly(i))) return i;
+  for (const i of cand) if (accept(i) && inside(lat, lon, poly(i))) return i;
   return -1;
 }
-function bestNear(lat, lon, radius, profile, exclude, n) {
-  return near(lat, lon, radius).filter(i => i !== exclude)
-    .sort((a, b) => (profileScore(b, profile) - profileScore(a, profile)) || (a - b)).slice(0, n);
+function bestNear(lat, lon, radius, exclude, n, accept = () => true) {
+  return near(lat, lon, radius).filter(i => i !== exclude && canAssess(i) && accept(i))
+    .sort((a, b) => (logisticsScore(b) - logisticsScore(a)) || (a - b)).slice(0, n);
 }
 """
 
@@ -364,7 +624,7 @@ HTML = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Склады Саратова</title>
+<title>Здания Саратова</title>
 <style>
 :root { --bg:#f4f3ef; --panel:#fff; --ink:#1f2429; --muted:#5f6771; --line:#dedbd2; --hot:#b42318; --zone:#b7791f; --accent:#1d4ed8;
   --font:"Segoe UI", system-ui, -apple-system, Roboto, sans-serif; }
@@ -385,7 +645,7 @@ h3 { font-size: 13px; margin: 12px 0 4px; }
 #sugg div { padding: 6px 10px; cursor: pointer; font-size: 13px; }
 #sugg div:hover, #sugg div.act { background: var(--bg); }
 .seg { display: flex; gap: 4px; margin: 10px 0 4px; flex-wrap: wrap; }
-.seg button { flex: 1; padding: 6px 4px; border: 1px solid var(--line); background: #fff; border-radius: 6px; cursor: pointer; font: 600 12px var(--font); color: var(--ink); }
+.seg button { flex: 1 0 auto; padding: 6px 8px; border: 1px solid var(--line); background: #fff; border-radius: 6px; cursor: pointer; font: 600 12px var(--font); color: var(--ink); }
 .seg button.on { background: var(--ink); color: #fff; border-color: var(--ink); }
 #card { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; background: #fcfbf8; margin-top: 10px; }
 .badge { display: inline-block; color: #fff; font-weight: 700; padding: 2px 10px; border-radius: 12px; font-size: 13px; }
@@ -413,8 +673,6 @@ table { width: 100%; border-collapse: collapse; font-size: 13px; }
 td, th { padding: 5px 4px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
 th { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; font-weight: 600; }
 td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
-.zone-row { cursor: pointer; } .zone-row:hover { background: var(--bg); }
-.znum { display: inline-block; font-size: 11px; font-weight: 700; padding: 1px 6px; border-radius: 9px; background: #fff3d6; color: #7a4f00; }
 .legend-bar { height: 10px; border-radius: 3px; background: linear-gradient(90deg, #b42318, #e8a317, #f7f0aa, #41ab5d, #006837); margin: 4px 0 2px; }
 .legend-scale { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); }
 .note { font-size: 12px; color: var(--muted); border-top: 1px solid var(--line); margin-top: 18px; padding-top: 10px; }
@@ -427,20 +685,22 @@ button:focus-visible, input:focus-visible, tr:focus-visible { outline: 2px solid
 <body>
 <div id="app">
 <aside>
-  <h1>Где ставить склад в Саратове</h1>
-  <p class="lead">Введите адрес объявления или нажмите на здание (здания с оценкой видны при приближении). Модель оценит, насколько место подходит под склад, и объяснит почему.</p>
-  <div id="search-wrap"><input id="search" type="search" placeholder="Адрес: например, Вольский тракт 1" aria-label="Поиск по адресу" autocomplete="off"><div id="sugg"></div></div>
-  <div class="seg" id="profiles" role="group" aria-label="Профиль склада"></div>
-  <div id="card"><p class="hint">Карточка здания появится здесь. Или выберите зону из списка «Лучшие зоны».</p></div>
-
-  <h2>Лучшие зоны (профиль «Универсальный»)</h2>
-  <table id="zones"><thead><tr><th>#</th><th>Где</th><th class="num">Балл</th></tr></thead><tbody></tbody></table>
+  <h1>Здания Саратова</h1>
+  <p class="lead">Найдите здание по адресу и проверьте, есть ли в нём коммерческие помещения.</p>
+  <div id="search-wrap"><input id="search" type="search" placeholder="Адрес или название здания" aria-label="Поиск по адресу или названию" autocomplete="off"><div id="sugg"></div></div>
+  <div class="seg" id="building-types" role="group" aria-label="Тип здания"></div>
+  <label id="commerce-controls">Показывать
+    <select id="commerce-level"><option value="any">Все с признаками</option><option value="confirmed">Только подтверждённые</option></select>
+  </label>
+  <div class="hint" id="building-count" aria-live="polite"></div>
+  <label class="layer"><input type="checkbox" id="complete-only"> Только с годом, площадью и типом <span id="complete-count" class="meta"></span></label>
+  <div id="card"><p class="hint">Нажмите на здание, чтобы открыть его карточку.</p></div>
 
   <h2>Слои</h2>
-  <div class="legend-bar"></div><div class="legend-scale"><span>0 — плохо</span><span>цвет здания = итог профиля</span><span>100 — отлично</span></div>
-  <label class="layer"><input type="checkbox" id="l-bld" checked> Здания с оценкой (с приближения 15)</label>
-  <label class="layer"><input type="checkbox" id="l-top" checked> Лучшие здания точками (при отдалении)</label>
-  <label class="layer"><input type="checkbox" id="l-zones" checked> Номера лучших зон</label>
+  <div id="commerce-legend"><span class="dot" style="background:#186943"></span>Подтверждено по назначению<br><span class="dot" style="background:#b46b16"></span>Есть признаки использования</div>
+  <div id="score-legend"><div class="legend-bar"></div><div class="legend-scale"><span>0 — плохо</span><span>оценка грузовой доступности</span><span>100 — отлично</span></div></div>
+  <label class="layer"><input type="checkbox" id="l-bld" checked> Контуры зданий (с приближения 15)</label>
+  <label class="layer"><input type="checkbox" id="l-top" checked> Точки зданий при отдалении</label>
   <label class="layer"><input type="checkbox" id="l-osm" checked> Обычная карта OpenStreetMap (нужен интернет)</label>
   <div id="status" class="hint"></div>
   <p class="hint"><a href="label.html" id="label-link">Разметка экспертами</a> — оценить 150 зданий «хорошо / средне / плохо», чтобы проверить и дообучить модель.</p>
@@ -499,18 +759,103 @@ const EXIT_COLORS = ["#1d4ed8", "#c026d3", "#0f766e", "#b45309", "#4d7c0f", "#be
 const pBox = pieces.map(p => { let s = 90, n = -90, w = 180, e = -180; for (const [la, lo] of p) { s = Math.min(s, la); n = Math.max(n, la); w = Math.min(w, lo); e = Math.max(e, lo); } return [s, w, n, e]; });
 
 // ---------- состояние ----------
-let profile = CFG.default_profile;
-try { const p = localStorage.getItem("wh-profile"); if (p && CFG.profiles[p]) profile = p; } catch (e) {}
-let current = -1, hover = -1, routesShown = null, zoneHi = null, pin = null;
+let current = -1, hover = -1, routesShown = null, pin = null;
+const FILTERS = { commerce: "Здания с коммерцией", retail: "Стрит-ритейл и услуги", office: "Офисы и коворкинги",
+  warehouse: "Склады и базы", production: "Производство и цеха", residential: "Жильё",
+  technical: "Технические объекты", auxiliary: "Прочие", all: "Все здания" };
+const TYPE_LABEL = { warehouse: "Склад", production: "Производственное здание",
+  residential: "Жилое здание", retail: "Торговое здание" };
+const COMMERCIAL_TYPES = new Set(["retail", "food", "auto", "services", "office", "hospitality", "warehouse", "production", "commercial"]);
+const BUSINESS_COLORS = {retail: "#087d8a", food: "#a14b20", services: "#7454a2", office: "#3667a9", hospitality: "#a34f69",
+  auto: "#a23d38", technical: "#586978", commercial: "#426d89"};
+const registryOf = i => D.registry?.[B.id[i]];
+const categoryOf = i => {
+  const r = registryOf(i);
+  if (r?.educational_use) return "education";
+  if (r?.gko_use === "production" && r.category_gko === "warehouse") return "warehouse";
+  return r?.gko_use || r?.category_gko || B.category[i];
+};
+const businessesOf = i => D.businesses?.[B.id[i]] || [];
+const USE_LABEL = { retail: "торговля", food: "общепит", services: "услуги", office: "офисы",
+  hospitality: "гостиницы", auto: "автомобильные объекты", warehouse: "склады", production: "производство", commercial: "коммерческое здание" };
+const USE_STATUS = { confirmed: "Коммерческая недвижимость подтверждена",
+  indicated: "Есть признаки коммерческого использования", unknown: "Нет данных о коммерции" };
+const osmCommercialUse = i => COMMERCIAL_TYPES.has(B.category[i]) ? B.category[i] : null;
+const confirmedUse = i => COMMERCIAL_TYPES.has(categoryOf(i)) ? categoryOf(i)
+  : categoryOf(i) === "residential" ? osmCommercialUse(i) : null;
+const commercialCategory = i => confirmedUse(i) || businessesOf(i)[0]?.category;
+const commerceStatus = B.id.map((_, i) => confirmedUse(i) ? "confirmed" : businessesOf(i).length ? "indicated" : "unknown");
+const isResidential = i => B.category[i] === "residential" || registryOf(i)?.category_gko === "residential";
+function canAssess(i) {
+  const category = categoryOf(i);
+  return i >= 0 && i < SCORED && (category === "warehouse" || category === "production");
+}
+const buildingTypeOf = i => {
+  const entry = registryOf(i), osmType = D.types[B.type[i]];
+  const label = entry?.institution_area_m2 != null ? "Учебный корпус"
+    : isResidential(i) ? (entry?.category_gko === "residential" && entry.type_detail) || TYPE_LABEL.residential
+    : entry?.type_detail || (entry?.gko_group?.startsWith("Производственные, производственно-складские") && !entry.category_gko
+      ? "Производственно-складское здание, подтип не уточнён" : TYPE_LABEL[categoryOf(i)]);
+  return label || (osmType === "здание (тип не указан)" || osmType === "тип не указан"
+    ? entry?.purpose || osmType : osmType);
+};
+const addressForCard = i => registryOf(i)?.address || registryOf(i)?.osm_point_address || addrOf(i);
+let buildingFilter = "commerce";
+const commerceLevel = document.getElementById("commerce-level");
+function filterGroup(kind, detail = "") {
+  if (kind === "hospitality") return "auxiliary";
+  if (kind === "food" || kind === "services") return "retail";
+  if (kind === "auto") return /автосервис|автомойк|обслуживания автомобилей|шиномонтаж/i.test(detail) ? "production" : "retail";
+  return kind;
+}
+function inCategory(i) {
+  if (buildingFilter === "all") return true;
+  if (buildingFilter === "commerce") return commerceStatus[i] === "confirmed" ||
+    (commerceLevel.value === "any" && commerceStatus[i] === "indicated");
+  if (buildingFilter === "residential") return isResidential(i);
+  const detail = registryOf(i)?.gko_use_detail;
+  return buildingFilter === filterGroup(categoryOf(i), detail) || buildingFilter === filterGroup(confirmedUse(i), detail) ||
+    businessesOf(i).some(b => filterGroup(b.category, b.label) === buildingFilter);
+}
+const buildingYear = entry => entry?.year_built ?? entry?.gis_year_built ?? entry?.osm_start_year;
+function hasCompleteCard(i) {
+  const entry = registryOf(i), nativeType = D.types[B.type[i]];
+  return buildingYear(entry) != null &&
+    (entry.area_m2 ?? entry.gis_area_m2 ?? entry.institution_area_m2) != null &&
+    Boolean(entry.category_gko || entry.purpose ||
+      (nativeType && !["здание (тип не указан)", "тип не указан"].includes(nativeType)));
+}
+const completeCards = B.id.map((_, i) => hasCompleteCard(i));
+const completeOnly = document.getElementById("complete-only");
+const visibleBuilding = i => inCategory(i) && (!completeOnly.checked || completeCards[i]);
 const $ = id => document.getElementById(id);
 const M = new MiniMap($("map"), { center: [51.56, 46.0], zoom: 11, tiles: location.protocol !== "file:",
   attribution: "Подложка, дороги и здания: © участники OpenStreetMap" });
 if (location.protocol === "file:") $("l-osm").checked = false;
-let scoreCache = null;
-function scores() { if (!scoreCache) { scoreCache = new Float64Array(NB); for (let i = 0; i < NB; i++) scoreCache[i] = profileScore(i, profile); } return scoreCache; }
 let topIdx = null;
-function topList() { if (!topIdx) { const s = scores(); topIdx = Array.from({ length: NB }, (_, i) => i).filter(i => s[i] >= 75).sort((a, b) => s[b] - s[a]).slice(0, 800); } return topIdx; }
-function fillOf(i) { if (B.mask[i] & (BITS.residential_type | BITS.residential_quarter | BITS.no_access)) return "#a3a3a3"; return color(scores()[i]); }
+function topList() {
+  if (!topIdx) {
+    const visible = Array.from({ length: NB }, (_, i) => i).filter(visibleBuilding);
+    if (buildingFilter === "commerce") return (topIdx = visible);
+    if (completeOnly.checked) {
+      const step = Math.max(1, Math.ceil(visible.length / 800));
+      topIdx = visible.filter((_, index) => index % step === 0);
+      return topIdx;
+    }
+    topIdx = visible.filter(i => buildingFilter !== "all" || (logisticsScore(i) ?? 0) >= 75)
+      .sort((a, b) => (logisticsScore(b) ?? 0) - (logisticsScore(a) ?? 0)
+        || Number(Boolean(registryOf(b)?.cadastral_number)) - Number(Boolean(registryOf(a)?.cadastral_number)))
+      .slice(0, 800);
+  }
+  return topIdx;
+}
+function fillOf(i) {
+  if (buildingFilter === "commerce") return commerceStatus[i] === "confirmed" ? "#186943" : "#b46b16";
+  const score = logisticsScore(i);
+  if (score !== null) return color(score);
+  return BUSINESS_COLORS[buildingFilter] || BUSINESS_COLORS[commercialCategory(i)]
+    || (completeOnly.checked ? "#287688" : "#a3a3a3");
+}
 
 // ---------- отрисовка ----------
 M.drawFn = (c, fast) => {
@@ -526,15 +871,13 @@ M.drawFn = (c, fast) => {
     c.globalAlpha = M.tilesShown ? 0.72 : 0.9; c.lineWidth = 0.6; c.strokeStyle = "#4b4f55";
     for (let gy = Math.floor(b.s / GS); gy <= Math.floor(b.n / GS); gy++)
       for (let gx = Math.floor(b.w / GS); gx <= Math.floor(b.e / GS); gx++)
-        for (const i of bGrid.get(gy + "," + gx) || []) { M.path(poly(i)); c.closePath(); c.fillStyle = fillOf(i); c.fill(); if (!fast) c.stroke(); }
+        for (const i of bGrid.get(gy + "," + gx) || []) { if (!visibleBuilding(i)) continue; M.path(poly(i)); c.closePath(); c.fillStyle = fillOf(i); c.fill(); if (!fast) c.stroke(); }
     c.globalAlpha = 1;
   } else if (z < 15 && $("l-top").checked) {
-    const s = scores(); for (const i of topList()) M.circle(B.lat[i], B.lon[i], z < 12 ? 2.5 : 3.5, color(s[i]), "rgba(0,0,0,.35)", 0.5);
+    for (const i of topList()) M.circle(B.lat[i], B.lon[i], z < 12 ? 2.5 : 3.5, fillOf(i), "rgba(0,0,0,.35)", 0.5);
   }
   // маршруты
   if (routesShown) routesShown.forEach((x, k) => { if (!x) return; M.path(pathLatLngs(x.path)); c.strokeStyle = "#fff"; c.lineWidth = 7; c.stroke(); c.strokeStyle = EXIT_COLORS[k]; c.lineWidth = 4.5; c.stroke(); });
-  // подсветка зоны
-  if (zoneHi) { c.strokeStyle = "#111"; c.lineWidth = 2; for (const r of zoneHi) { const [x1, y1] = M.pt(r[1][0], r[0][1]), [x2, y2] = M.pt(r[0][0], r[1][1]); c.strokeRect(x1, y1, x2 - x1, y2 - y1); } }
   // наведённое и выбранное здание
   if (hover >= 0 && z >= 15) { M.path(poly(hover)); c.closePath(); c.strokeStyle = "#111"; c.lineWidth = 2.5; c.stroke(); }
   if (current >= 0) { M.path(poly(current)); c.closePath(); c.strokeStyle = "#111"; c.lineWidth = 3.5; c.stroke();
@@ -542,52 +885,82 @@ M.drawFn = (c, fast) => {
   if (pin) M.circle(pin[0], pin[1], 7, "#fff", "#111", 2.5);
   // выезды
   D.exits.forEach((x, k) => { if (x.lonlat) M.circle(x.lonlat[1], x.lonlat[0], 8, EXIT_COLORS[k], "#fff", 2); });
-  // номера зон
-  if ($("l-zones").checked) zoneMarks().forEach(([k, i]) => { const [x, y] = M.circle(B.lat[i], B.lon[i], 10, "#b7791f", "#fff", 2);
-    c.fillStyle = "#fff"; c.font = "700 11px Segoe UI, sans-serif"; c.textAlign = "center"; c.textBaseline = "middle"; c.fillText(String(k + 1), x, y + 0.5); });
 };
-const zoneMarks = () => D.zones.slice(0, CFG.zones.top_n).map((z, k) => [k, z.best]);
 function hitMarker(px, py) {
-  if ($("l-zones").checked) for (const [k, i] of zoneMarks()) { const [x, y] = M.pt(B.lat[i], B.lon[i]); if (Math.hypot(x - px, y - py) <= 11) return { zone: k }; }
   for (let k = 0; k < D.exits.length; k++) { const x = D.exits[k]; if (!x.lonlat) continue; const [sx, sy] = M.pt(x.lonlat[1], x.lonlat[0]);
     if (Math.hypot(sx - px, sy - py) <= 9) return { exit: k }; }
   return null;
 }
 M.on("click", (lat, lon, px, py) => {
-  const m = hitMarker(px, py); if (m && m.zone != null) return showZone(m.zone);
-  const i = buildingAt(lat, lon); i >= 0 ? showBuilding(i, false) : showNoBuilding(lat, lon);
+  if (M.getZoom() < 15 && $("l-top").checked) {
+    for (const j of topList()) {
+      const [x, y] = M.pt(B.lat[j], B.lon[j]);
+      if (Math.hypot(x - px, y - py) <= 5) return showBuilding(j, true);
+    }
+  }
+  const i = $("l-bld").checked ? buildingAt(lat, lon, visibleBuilding) : -1;
+  i >= 0 ? showBuilding(i, false) : showNoBuilding(lat, lon);
 });
 M.on("hover", (lat, lon, px, py) => {
   const m = hitMarker(px, py);
   if (m) { M.cv.style.cursor = "pointer"; if (hover !== -1) { hover = -1; M.request(); }
-    return M.showTip(m.zone != null ? `<b>Зона ${m.zone + 1}</b> · ${f0(D.zones[m.zone].score)} — нажмите, чтобы открыть` : `Выезд: <b>${esc(D.exits[m.exit].name)}</b>`, px, py); }
+    return M.showTip(`Выезд: <b>${esc(D.exits[m.exit].name)}</b>`, px, py); }
   M.cv.style.cursor = "grab";
-  const i = M.getZoom() >= 15 && $("l-bld").checked ? buildingAt(lat, lon) : -1;
+  const i = M.getZoom() >= 15 && $("l-bld").checked ? buildingAt(lat, lon, visibleBuilding) : -1;
   if (i !== hover) { hover = i; M.request(); }
-  if (i >= 0) M.showTip(`${esc(addrOf(i))} · <b>${f0(scores()[i])}</b>`, px, py); else M.hideTip();
+  if (i >= 0) M.showTip(`${esc(addressForCard(i))} · <b>${esc(buildingTypeOf(i))}</b>`, px, py); else M.hideTip();
 });
 M.on("tileerror", () => { if (M.tileOk) return; $("status").textContent = location.protocol === "file:"
   ? "Обычная карта OSM не грузится в файле, открытом с диска: рисуем свои дороги. Для подложки откройте «Открыть карту складов.cmd»."
   : "Обычная карта OSM не загрузилась: проверьте интернет. Рисуем свои дороги."; });
 
-// ---------- профиль ----------
-const segEl = $("profiles");
-Object.entries(CFG.profiles).forEach(([key, p]) => { const b = document.createElement("button"); b.textContent = p.name; b.dataset.p = key;
-  b.onclick = () => setProfile(key); segEl.appendChild(b); });
-function setProfile(p) { profile = p; scoreCache = null; topIdx = null; try { localStorage.setItem("wh-profile", p); } catch (e) {}
-  segEl.querySelectorAll("button").forEach(b => b.classList.toggle("on", b.dataset.p === p));
-  M.request(); if (current >= 0) showBuilding(current, false); }
-
 // ---------- карточка здания ----------
 const card = $("card");
+const initialCard = card.innerHTML;
+const typeButtons = $("building-types");
+for (const [key, label] of Object.entries(FILTERS)) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.textContent = label;
+  button.dataset.category = key;
+  button.onclick = () => setBuildingFilter(key);
+  typeButtons.appendChild(button);
+}
+function setBuildingFilter(key) {
+  buildingFilter = key;
+  $("commerce-controls").hidden = key !== "commerce";
+  $("commerce-legend").hidden = key !== "commerce";
+  $("score-legend").hidden = !["all", "warehouse", "production"].includes(key);
+  topIdx = null;
+  hover = -1;
+  M.hideTip();
+  if (current >= 0 && !visibleBuilding(current)) {
+    current = -1;
+    routesShown = null;
+    card.innerHTML = initialCard;
+  }
+  for (const button of typeButtons.children) {
+    const active = button.dataset.category === key;
+    button.classList.toggle("on", active);
+    button.setAttribute("aria-pressed", active);
+  }
+  const completeCount = completeCards.reduce((count, complete, i) => count + Number(complete && inCategory(i)), 0);
+  $("complete-count").textContent = "(" + completeCount.toLocaleString("ru") + ")";
+  const visibleCount = completeOnly.checked ? completeCount : B.id.reduce((n, _, i) => n + Number(inCategory(i)), 0);
+  $("building-count").textContent = "Зданий в выборке: " + visibleCount.toLocaleString("ru");
+  updateSuggestions();
+  M.request();
+}
+completeOnly.onchange = () => setBuildingFilter(buildingFilter);
+commerceLevel.onchange = () => setBuildingFilter("commerce");
 function bar(label, v, hint) { return `<div class="bar" title="${esc(hint || "")}"><span>${label}</span><span class="track"><span class="fill" style="width:${clip(v)}%;background:${color(v)}"></span></span><span class="v">${f0(v)}</span></div>`; }
 function cbar(label, c) { const w = Math.min(50, Math.abs(c) / 2), left = c >= 0 ? 50 : 50 - w;
   return `<div class="cbar"><span>${label}</span><span class="axis"><span style="left:${left}%;width:${w}%;background:${c >= 0 ? "#41ab5d" : "#d9822b"}"></span></span><span class="v">${c > 0 ? "+" : ""}${f0(c)}</span></div>`; }
 const UNKNOWN = `<details><summary>Как это считается и чего мы не знаем</summary>
-  <p><b>Итог</b> = ${CFG.alpha} × балл модели + ${(1 - CFG.alpha).toFixed(1)} × формула профиля, затем правила безопасности.</p>
+  <p><b>Итог</b> = ${CFG.alpha} × балл модели + ${(1 - CFG.alpha).toFixed(1)} × формула грузовой доступности, затем ограничения.</p>
   <ul class="list">
   <li><b>Балл модели</b>: «лучше, чем X% зданий города». Модель (${esc(D.model.name)}) обучена отличать места, где склады и производства стоят сейчас, от остальных; проверена на районах, которых не видела (ROC-AUC ${D.model.auc}, у формулы ${D.model.formulaAuc}).</li>
-  <li><b>Формула профиля</b>: выезд, доставка по городу, последняя миля, само здание, ж/д и соседние склады; веса — в warehouse_config.json.</li>
+  <li><b>Формула грузовой доступности</b>: выезд, доставка по городу, последняя миля, само здание, ж/д и соседние склады; веса — в warehouse_config.json.</li>
   <li><b>Вклад групп</b>: насколько изменился бы балл модели, если бы эта группа признаков была «как у среднего здания города».</li>
   <li><b>Правила</b>: ≤ 20 без проезда, ≤ 40 через жилые дворы, ≤ 30 жилой дом, ≤ 40 здание без типа в жилом квартале, ≤ 50 меньше 100 м².</li></ul>
   <p><b>Чего мы не знаем:</b></p><ul class="list">
@@ -601,19 +974,65 @@ function timesHtml(v) {
   return `<div class="times">${CFG.exits.names.map((k, j) => `<span><span class="dot" style="background:${EXIT_COLORS[j]}"></span>${esc(k)}</span><span>${v.times[k] == null ? "нет пути" : f0(v.times[k]) + " мин"}</span>`).join("")}
   <span>До центра города</span><span>${f0(v.city_center)} мин</span><span>Среднее до центров спроса</span><span>${f0(v.city_mean)} мин</span></div>`;
 }
+function buildingFacts(i) {
+  const entry = registryOf(i);
+  const m2 = value => value == null ? "нет данных" : value.toLocaleString("ru") + " м²";
+  const built = buildingYear(entry);
+  const yearSource = entry?.year_built != null ? "ГКО" : entry?.gis_year_built != null ? "ГИС ЖКХ" : "OSM";
+  return `<div class="meta">Адрес: <b>${esc(addressForCard(i))}</b><br>
+    Тип здания: <b>${esc(buildingTypeOf(i))}</b><br>
+    <b>${USE_STATUS[commerceStatus[i]]}</b><br>
+    ${entry?.gko_group ? "Подгруппа ГКО: " + esc(entry.gko_group) + "<br>" : ""}
+    ${categoryOf(i) === "hospitality" || businessesOf(i).some(b => b.category === "hospitality") ? "Прочие · Гостиничный бизнес<br>" : ""}
+    ${entry?.gko_use_detail && entry.gko_use_detail !== entry.gko_group ? "Наименование по ГКО: " + esc(entry.gko_use_detail) + "<br>" : ""}
+    ${osmCommercialUse(i) ? "Тип здания по OSM: " + esc(USE_LABEL[B.category[i]]) + "<br>" : ""}
+    ${businessesOf(i).length ? "Отмечено в контуре OSM: " + esc([...new Set(businessesOf(i).map(b => USE_LABEL[b.category]))].join(", ")) + "<br>" : ""}
+    ${entry?.gko_nonresidential_units ? "По ГКО в доме есть встроенные нежилые помещения.<br>" : ""}
+    ${B.name[i] ? "Название: <b>" + esc(B.name[i]) + "</b><br>" : ""}
+    Год постройки: <b>${esc(built ?? "нет данных")}</b>${built != null ? " (" + yearSource + ")" : ""}<br>
+    ${entry?.year_opened != null ? `Год ввода в эксплуатацию: <b>${esc(entry.year_opened)}</b> (ГКО)<br>` : ""}
+    Этажей: <b>${esc(entry?.floors ?? entry?.osm_levels ?? "нет данных")}</b>
+    ${entry?.floors == null && entry?.osm_levels != null ? " (надземные по OSM)" : ""}
+    ${entry?.underground_floors != null ? ` (подземных: ${esc(entry.underground_floors)})` : ""}<br>
+    ${entry?.wall_material ? `Материал стен: <b>${esc(entry.wall_material)}</b><br>` : ""}
+    Площадь контура OSM: <b>${m2(B.area[i])}</b>
+    ${entry?.area_m2 != null ? `<br>Площадь по ГКО: <b>${m2(entry.area_m2)}</b>` : ""}
+    ${entry?.gis_area_m2 != null ? `<br>Общая площадь по ГИС ЖКХ: <b>${m2(entry.gis_area_m2)}</b>` : ""}
+    ${entry?.institution_area_m2 != null ? `<br>Площадь по данным <a href="${esc(entry.institution_source)}" target="_blank" rel="noopener">СГУ</a>: <b>${m2(entry.institution_area_m2)}</b>` : ""}
+    <br>Кадастровый номер: <b>${esc(entry?.cadastral_number ?? "нет данных")}</b>
+    ${entry?.gar_source ? " (" + esc(entry.gar_source) + ")" : ""}
+    ${entry?.manual_source ? `<br>Ручная сверка: ${esc(entry.manual_source)}` : ""}
+    </div>`;
+}
+function businessFacts(i) {
+  const businesses = businessesOf(i);
+  if (!businesses.length) return "";
+  return `<details><summary>Объекты OSM в здании (${businesses.length})</summary><ul class="list">${businesses.map(b => {
+    const floor = b.level === "0" ? " · первый этаж"
+      : b.level ? " · уровень OSM " + esc(b.level) : "";
+    return `<li>${esc(b.label)}${b.name ? " · " + esc(b.name) : ""}${floor}</li>`;
+  }).join("")}</ul></details>`;
+}
+const osmLink = i => `<p class="hint">OSM: <a href="${osmUrl(i)}" target="_blank" rel="noopener">${B.id[i] < 0 ? "relation " + -B.id[i] : "way " + B.id[i]}</a></p>`;
 function showBuilding(i, move) {
-  current = i; routesShown = null; zoneHi = null; pin = null;
-  const total = profileScore(i, profile), bd = badgeOf(total), ex = explain(i), v = ex.v;
+  if (!visibleBuilding(i)) setBuildingFilter("all");
+  current = i; routesShown = null; pin = null;
   if (move) M.setView([B.lat[i], B.lon[i]], Math.max(M.getZoom(), 16)); else M.request();
-  const alt = bestNear(B.lat[i], B.lon[i], CFG.alternative_radius_km * 1000, profile, i, 1)[0];
-  const altT = alt != null ? profileScore(alt, profile) : -1;
+  const total = logisticsScore(i);
+  if (total === null) {
+    card.innerHTML = buildingFacts(i) + businessFacts(i) + osmLink(i);
+    return;
+  }
+  const bd = badgeOf(total), ex = explain(i), v = ex.v;
+  const alt = bestNear(B.lat[i], B.lon[i], CFG.alternative_radius_km * 1000, i, 1,
+    j => visibleBuilding(j) && categoryOf(j) === categoryOf(i))[0];
+  const altT = alt != null ? logisticsScore(alt) : -1;
   const altHtml = alt != null && altT > total + 3 ? `<h3>Лучше рядом (до ${CFG.alternative_radius_km} км)</h3>
      <p>${esc(addrOf(alt))} — <b>${f0(altT)}</b> (на ${f0(altT - total)} лучше) <button class="small" id="alt-go">Показать</button></p>` : "";
-  const name = B.name[i] ? esc(B.name[i]) + " — " : "";
-  card.innerHTML = `<span class="badge" style="background:${bd.color}">${bd.label}</span> <span class="meta">профиль «${esc(CFG.profiles[profile].name)}»</span>
+  card.innerHTML = `<span class="badge" style="background:${bd.color}">${bd.label}</span> <span class="meta">Грузовая доступность</span>
     <div class="total">${f0(total)} / 100</div>
-    <div class="meta">Адрес: <b>${esc(addrOf(i))}</b><br>Здание: <b>${name}${esc(D.types[B.type[i]])}</b> · площадь <b>${B.area[i].toLocaleString("ru")} м²</b><br>
-    Модель: место лучше, чем у <b>${f0(B.ml[i] / 10)}%</b> зданий города</div>
+    ${buildingFacts(i)}${businessFacts(i)}
+    <div class="meta">Модель: место лучше, чем у <b>${f0(B.ml[i] / 10)}%</b> зданий города</div>
     ${ex.rules.length ? `<div class="rule"><b>Сработало правило:</b> ${ex.rules.map(esc).join("; ")}</div>` : ""}
     <h3>Время фуры (среднее туда и обратно)</h3>${timesHtml(v)}
     <h3>Из чего сложился итог</h3>
@@ -626,7 +1045,7 @@ function showBuilding(i, move) {
     ${altHtml}
     <h3>Маршруты фуры</h3>
     <button class="small" id="ro">склад → выезды</button><button class="small" id="ri">выезды → склад</button><div id="rt" class="hint"></div>
-    ${UNKNOWN}<p class="hint">OSM: <a href="${osmUrl(i)}" target="_blank" rel="noopener">${B.id[i] < 0 ? "relation " + -B.id[i] : "way " + B.id[i]}</a></p>`;
+    ${UNKNOWN}${osmLink(i)}`;
   $("ro").onclick = () => drawRoutes(routes(B.piece[i], true), "склад → выезд");
   $("ri").onclick = () => drawRoutes(routes(B.piece[i], false), "выезд → склад");
   if ($("alt-go")) $("alt-go").onclick = () => showBuilding(alt, true);
@@ -634,11 +1053,13 @@ function showBuilding(i, move) {
 function drawRoutes(res, title) { routesShown = res; M.request();
   $("rt").innerHTML = `${title}: ` + res.map((x, k) => `<span class="dot" style="background:${EXIT_COLORS[k]}"></span>${esc(D.exits[k].name)} ${x ? f0(x.time) + " мин" : "нет пути"}`).join(" · "); }
 function showNoBuilding(lat, lon, note) {
-  current = -1; routesShown = null; zoneHi = null; pin = [lat, lon]; M.request();
-  const best = bestNear(lat, lon, CFG.no_building_radius_km * 1000, profile, -1, 3);
-  card.innerHTML = `<p><b>Здесь нет здания.</b> Балл ставим только зданиям.${note ? " " + esc(note) : ""}</p>
+  current = -1; routesShown = null; pin = [lat, lon]; M.request();
+  const best = bestNear(lat, lon, CFG.no_building_radius_km * 1000, -1, 3, visibleBuilding);
+  const message = completeOnly.checked ? "Здесь нет здания с заполненной карточкой."
+    : buildingFilter === "all" ? "Здесь нет здания." : "Здесь нет здания выбранного типа.";
+  card.innerHTML = `<p><b>${message}</b>${note ? " " + esc(note) : ""}</p>
     <h3>Лучшие здания в радиусе ${CFG.no_building_radius_km} км</h3>
-    ${best.length ? `<ol class="list">${best.map(j => `<li>${esc(addrOf(j))} — <b>${f0(profileScore(j, profile))}</b> <button class="small" data-j="${j}">показать</button></li>`).join("")}</ol>` : `<p class="hint">Рядом нет оценённых зданий.</p>`}`;
+    ${best.length ? `<ol class="list">${best.map(j => `<li>${esc(addrOf(j))} — <b>${f0(logisticsScore(j))}</b> <button class="small" data-j="${j}">показать</button></li>`).join("")}</ol>` : `<p class="hint">Рядом нет оценённых зданий.</p>`}`;
   card.querySelectorAll("button[data-j]").forEach(b => b.onclick = () => showBuilding(+b.dataset.j, true));
 }
 
@@ -658,25 +1079,33 @@ function normAddr(s) {   // как build_model.norm_address
 }
 let addrNorm = null;
 function searchBuildings(q, limit) {
-  if (!addrNorm) addrNorm = B.addr.map((a, i) => (a || B.name[i]) ? normAddr(a + " " + B.name[i]) : "");
+  if (!addrNorm) addrNorm = B.addr.map((a, i) => normAddr([
+    a, B.name[i], registryOf(i)?.address, registryOf(i)?.osm_point_address,
+    ...businessesOf(i).map(b => b.name),
+  ].filter(Boolean).join(" ")));
   const t = normAddr(q).split(" ").filter(Boolean); if (!t.length) return [];
   const hits = [];
-  for (let i = 0; i < NB; i++) { const a = addrNorm[i]; if (!a) continue; const ws = a.split(" ");
+  for (let i = 0; i < NB; i++) { const a = addrNorm[i]; if (!a || !visibleBuilding(i)) continue; const ws = a.split(" ");
     if (t.every(x => ws.some(w => w === x || (w.startsWith(x) && !/^\d+$/.test(x))))) hits.push(i); }
   hits.sort((a, b) => (addrNorm[a].length - addrNorm[b].length) || (a - b));
   return hits.slice(0, limit);
 }
 const sIn = $("search"), sugg = $("sugg");
 let suggIdx = [], act = -1;
-sIn.addEventListener("input", () => { suggIdx = sIn.value.trim().length >= 2 ? searchBuildings(sIn.value, 8) : []; act = -1; renderSugg(); });
+function updateSuggestions() {
+  suggIdx = sIn.value.trim().length >= 2 ? searchBuildings(sIn.value, 8) : [];
+  act = -1;
+  if (document.activeElement === sIn) renderSugg(); else sugg.style.display = "none";
+}
+sIn.addEventListener("input", updateSuggestions);
 function renderSugg() {
   if (!sIn.value.trim()) { sugg.style.display = "none"; return; }
-  sugg.innerHTML = suggIdx.map((i, k) => `<div data-i="${i}" class="${k === act ? "act" : ""}">${esc(addrOf(i))}${B.name[i] && B.addr[i] ? " · " + esc(B.name[i]) : ""} — <b>${f0(profileScore(i, profile))}</b></div>`).join("")
+  sugg.innerHTML = suggIdx.map((i, k) => `<div data-i="${i}" class="${k === act ? "act" : ""}">${esc(addressForCard(i))}${B.name[i] && B.addr[i] ? " · " + esc(B.name[i]) : ""}${canAssess(i) ? " — <b>" + f0(logisticsScore(i)) + "</b>" : ""}</div>`).join("")
     + `<div data-nom="1">Искать «${esc(sIn.value)}» в Nominatim (интернет)</div>`;
   sugg.style.display = "block";
   sugg.querySelectorAll("div").forEach(d => d.onclick = () => d.dataset.nom ? nominatim(sIn.value) : pick(+d.dataset.i));
 }
-function pick(i) { sugg.style.display = "none"; sIn.value = addrOf(i); showBuilding(i, true); }
+function pick(i) { sugg.style.display = "none"; sIn.value = addressForCard(i); showBuilding(i, true); }
 sIn.addEventListener("keydown", ev => {
   if (ev.key === "ArrowDown") { act = Math.min(act + 1, suggIdx.length - 1); renderSugg(); ev.preventDefault(); }
   else if (ev.key === "ArrowUp") { act = Math.max(act - 1, -1); renderSugg(); ev.preventDefault(); }
@@ -701,43 +1130,19 @@ async function nominatim(q) {
     } catch (e) { card.innerHTML = `<p>Nominatim недоступен (нужен интернет). Попробуйте ввести адрес как в OSM: «улица, номер дома».</p>`; return; }
   }
   if (res.none) { card.innerHTML = `<p>Адрес «${esc(q)}» не найден ни среди зданий OSM, ни в Nominatim.</p>`; return; }
-  let i = buildingAt(res.lat, res.lon);
-  if (i < 0) { const c = near(res.lat, res.lon, CFG.address_snap_m).sort((a, b) => distM(B.lat[a], B.lon[a], res.lat, res.lon) - distM(B.lat[b], B.lon[b], res.lat, res.lon)); if (c.length) i = c[0]; }
+  let i = buildingAt(res.lat, res.lon, visibleBuilding);
+  if (i < 0) { const c = near(res.lat, res.lon, CFG.address_snap_m).filter(visibleBuilding).sort((a, b) => distM(B.lat[a], B.lon[a], res.lat, res.lon) - distM(B.lat[b], B.lon[b], res.lat, res.lon)); if (c.length) i = c[0]; }
   if (i >= 0) showBuilding(i, true); else { M.setView([res.lat, res.lon], 16); showNoBuilding(res.lat, res.lon, `Nominatim: ${res.name}`); }
 }
 
-// ---------- зоны ----------
-const ZC = CFG.zones.cell_m;
-function zoneRects(z) { return z.cells.map(([i, j]) => [[j * ZC / KY, i * ZC / KX], [(j + 1) * ZC / KY, (i + 1) * ZC / KX]]); }
-function showZone(k) {
-  const z = D.zones[k]; current = -1; routesShown = null; pin = null; zoneHi = zoneRects(z);
-  let s = 90, n = -90, w = 180, e = -180; for (const r of zoneHi) { s = Math.min(s, r[0][0]); n = Math.max(n, r[1][0]); w = Math.min(w, r[0][1]); e = Math.max(e, r[1][1]); }
-  M.fitBounds(s, w, n, e, 16);
-  const ex = explain(z.best), bd = badgeOf(z.score);
-  card.innerHTML = `<span class="badge" style="background:${bd.color}">${bd.label}</span> <b>Зона ${k + 1}</b>
-    <div class="total">${f0(z.score)} / 100 <span class="meta">лучшее здание · в среднем ${z.mean == null ? "—" : f0(z.mean)} (нежилые)</span></div>
-    <div class="meta">Улицы: <b>${esc(z.streets)}</b><br>Площадь ≈ <b>${f0(z.area)} га</b> · подходящих зданий (≥ ${CFG.zones.suitable_score}): <b>${z.nSuitable}</b> · отличных (≥ ${CFG.zones.good_score}): <b>${z.nGood}</b></div>
-    <h3>Время фуры от лучшего здания</h3>${timesHtml(ex.v)}
-    <h3>Почему</h3><ul class="list">${ex.pros.map(t => `<li>${esc(t)}</li>`).join("")}</ul>
-    ${ex.warnings.length ? `<h3>Предупреждения</h3><ul class="list warn">${ex.warnings.map(t => `<li>${esc(t)}</li>`).join("")}</ul>` : ""}
-    <h3>Топ-3 здания</h3><ol class="list">${z.top3.map(j => `<li>${esc(addrOf(j))} — <b>${f0(profileScore(j, "universal"))}</b> <button class="small" data-j="${j}">открыть</button></li>`).join("")}</ol>
-    <p class="hint">Зоны посчитаны для профиля «Универсальный».</p>${UNKNOWN}`;
-  card.querySelectorAll("button[data-j]").forEach(b => b.onclick = () => showBuilding(+b.dataset.j, true));
-}
-D.zones.slice(0, CFG.zones.top_n).forEach((z, k) => {
-  const tr = document.createElement("tr"); tr.className = "zone-row"; tr.tabIndex = 0;
-  tr.innerHTML = `<td><span class="znum">${k + 1}</span></td><td>${esc(z.streets || addrOf(z.best))}</td><td class="num"><b>${f0(z.score)}</b></td>`;
-  tr.onclick = () => showZone(k); tr.onkeydown = ev => { if (ev.key === "Enter") showZone(k); };
-  document.querySelector("#zones tbody").appendChild(tr);
-});
-
 // ---------- слои ----------
-["l-bld", "l-top", "l-zones"].forEach(id => $(id).onchange = () => M.request());
+["l-bld", "l-top"].forEach(id => $(id).onchange = () => M.request());
 $("l-osm").onchange = ev => { M.tilesOn = ev.target.checked; M.request(); };
 $("model-note").innerHTML = `Модель: ${esc(D.model.name)}, проверка на незнакомых районах: ROC-AUC ${D.model.auc} (формула ${D.model.formulaAuc}), AP ${D.model.ap} (формула ${D.model.formulaAp}). Расчёт ${esc(D.model.date)}.
-  Экспертная проверка: ${esc(typeof D.model.expert === "string" ? D.model.expert : "есть, см. отчёт")}. Время в пути — модель загруженности из Colab «модель дорог». Карта нарисована без сторонних библиотек; подложка, дороги и здания: © участники OpenStreetMap.`;
-setProfile(profile);
-window.WH = { profileScore, explain, valuesFor, buildingAt, bestNear, searchBuildings, normAddr, addrOf, showBuilding, showZone, M };
+  Экспертная проверка: ${esc(typeof D.model.expert === "string" ? D.model.expert : "есть, см. отчёт")}. Время в пути — модель загруженности из Colab «модель дорог». Подложка, дороги и здания: © участники OpenStreetMap.
+  ${Object.values(D.registry || {}).some(r => r.gis_area_m2 != null || r.gis_year_built != null) ? '<br>Данные многоквартирных домов: Минстрой, ГИС ЖКХ, обработка <a href="https://tochno.st/datasets/gisgkh" target="_blank" rel="noopener">«Если быть точным»</a>, август 2026, CC BY 4.0.' : ""}`;
+setBuildingFilter("commerce");
+window.WH = { logisticsScore, explain, valuesFor, buildingAt, bestNear, searchBuildings, normAddr, addrOf, showBuilding, M };
 </script>
 </body>
 </html>
@@ -909,6 +1314,9 @@ def build_single_file(payload, out=OUT):
     assert "map_data.js" not in html and "leaflet" not in html.lower()
     path = out / SINGLE_NAME
     path.write_text(html, encoding="utf-8")
+    previous = out / "Карта складов Саратова.html"
+    if previous.exists():
+        shutil.copyfile(path, previous)
     return path
 
 
